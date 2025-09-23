@@ -69,8 +69,17 @@ def build_ydl_opts(platform: str, outtmpl: str, audio_only: bool = False) -> dic
     }
     if audio_only:
         opts['format'] = 'bestaudio/best'
+        opts['postprocessors'] = [
+            {
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }
+        ]
     else:
-        opts['format'] = 'best'
+        # Prefer mp4 container for better Telegram compatibility; fall back to best
+        opts['format'] = 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b'
+        opts['merge_output_format'] = 'mp4'
 
     # Optional cookie support
     cookie_file = os.path.join(base_dir, 'data', 'cookies.txt')
@@ -80,6 +89,12 @@ def build_ydl_opts(platform: str, outtmpl: str, audio_only: bool = False) -> dic
     # Platform-specific tweaks (excluding TikTok - now handled separately)
     if platform in ['facebook', 'instagram', 'youtube']:
         opts['geo_bypass'] = True
+
+    # YouTube-specific robustness: use Android client to bypass some age/consent walls
+    if platform == 'youtube':
+        opts.setdefault('extractor_args', {})
+        opts['extractor_args'].setdefault('youtube', {})
+        opts['extractor_args']['youtube']['player_client'] = ['android']
 
     return opts
 
