@@ -267,6 +267,13 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def download_direct(url: str, platform: str, update: Update) -> bool:
     try:
+                # Prefer Piped for YouTube if enabled
+        if platform == 'youtube' and YOUTUBE_PIPED_ENABLED:
+            path = _download_youtube_via_piped(url, platform)
+            if path and os.path.exists(path):
+                await send_file_with_buttons(update, platform, path, url)
+                return True
+
         ydl_opts = build_ydl_opts(platform, get_download_path(platform, '%(title)s.%(ext)s'))
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
@@ -394,6 +401,7 @@ async def download_urls_from_reply(update: Update, context: ContextTypes.DEFAULT
             success = await download_direct(url, platform, update)
         if not success:
             pass
+
 
 
 
