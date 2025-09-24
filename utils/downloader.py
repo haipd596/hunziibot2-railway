@@ -5,6 +5,9 @@ import hashlib
 import time
 from urllib.parse import urlparse
 import yt_dlp
+import requests
+import subprocess
+import shlex
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 import logging
@@ -39,6 +42,7 @@ PLATFORM_PATTERNS = {
     'pinterest': r'(?:https?://)?(?:www\.)?(?:pinterest\.com|pin\.it)',
     'qqmusic': r'(?:https?://)?(?:www\.)?(?:y\.qq\.com|i\.y\.qq\.com)',
 }
+
 # Prefer using Piped API for YouTube if available to avoid cookie challenges
 YOUTUBE_PIPED_ENABLED = os.getenv('YOUTUBE_PIPED_ENABLED', 'true').lower() in ('1', 'true', 'yes')
 PIPED_INSTANCES = [
@@ -104,6 +108,124 @@ def build_ydl_opts(platform: str, outtmpl: str, audio_only: bool = False) -> dic
         opts['extractor_args']['youtube']['player_client'] = ['android']
 
     return opts
+
+def _extract_youtube_id(url: str) -> str | None:
+    try:
+        # Handle various YouTube URL formats
+        m = re.search(r"(?:v=|/shorts/|/live/|youtu\.be/)([A-Za-z0-9_-]{6,})", url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def _select_best_piped_stream(streams: list[dict]) -> dict | None:
+    # Prefer MP4 video with audio if available; fall back to highest quality MP4
+    mp4_streams = [s for s in streams if (s.get('container') == 'mp4' or (s.get('mimeType') or '').startswith('video/mp4'))]
+    if not mp4_streams:
+        return None
+    def parse_quality(s: dict) -> int:
+        q = s.get('qualityLabel') or s.get('quality') or ''
+        m = re.search(r"(\d+)", q)
+        return int(m.group(1)) if m else 0
+    mp4_streams.sort(key=parse_quality, reverse=True)
+    return mp4_streams[0]
+
+def _download_file(url: str, dest_path: str, headers: dict | None = None, timeout: int = 30) -> bool:
+    try:
+        with requests.get(url, stream=True, headers=headers or {'User-Agent': 'Mozilla/5.0'}, timeout=timeout) as r:
+            r.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except Exception as e:
+        logger.error(f"Piped download failed: {e}")
+        return False
+
+def _download_youtube_via_piped(url: str, platform: str) -> str | None:
+    video_id = _extract_youtube_id(url)
+    if not video_id:
+        return None
+    for base in PIPED_INSTANCES:
+        try:
+            # Use streams endpoint which exposes separate video/audio URLs
+            api_url = f"{base}/api/v1/streams/{video_id}"
+            resp = requests.get(api_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            title = data.get('title') or video_id
+            v_streams = data.get('videoStreams') or []
+            a_streams = data.get('audioStreams') or []
+
+            # Try muxed stream first (videoOnly == False)
+            muxed = [s for s in v_streams if not s.get('videoOnly')]
+            def quality_key(s: dict) -> int:
+                q = s.get('qualityLabel') or s.get('quality') or ''
+                m = re.search(r"(\d+)", q)
+                return int(m.group(1)) if m else 0
+            muxed.sort(key=quality_key, reverse=True)
+
+            out_dir = get_download_path(platform, '')
+            safe_title = re.sub(r"[\\/:*?\"<>|]", "_", title)
+            if muxed:
+                dest_path = os.path.join(out_dir, f"{safe_title}.mp4")
+                if _download_file(muxed[0].get('url'), dest_path):
+                    return dest_path
+
+            # Fallback: pick best videoOnly + best audio and merge via ffmpeg
+            video_only = [s for s in v_streams if s.get('videoOnly')]
+            video_only.sort(key=quality_key, reverse=True)
+            # Prefer m4a/mp4 audio
+            def audio_rank(a: dict) -> tuple[int, int]:
+                mime = (a.get('mimeType') or '').lower()
+                # prefer m4a/aac, then anything else
+                score = 2 if ('mp4' in mime or 'm4a' in mime or 'aac' in mime) else 1
+                abr = a.get('bitrate') or 0
+                return (score, int(abr))
+            a_streams.sort(key=audio_rank, reverse=True)
+
+            if video_only and a_streams:
+                v = video_only[0]
+                a = a_streams[0]
+                v_path = os.path.join(out_dir, f"{safe_title}.video.mp4")
+                a_ext = '.m4a' if ('m4a' in (a.get('mimeType') or '').lower()) else '.audio'
+                a_path = os.path.join(out_dir, f"{safe_title}{a_ext}")
+                final_path = os.path.join(out_dir, f"{safe_title}.mp4")
+                if not _download_file(v.get('url'), v_path):
+                    continue
+                if not _download_file(a.get('url'), a_path):
+                    try:
+                        os.remove(v_path)
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    cmd = f"ffmpeg -y -i {shlex.quote(v_path)} -i {shlex.quote(a_path)} -c copy {shlex.quote(final_path)}"
+                    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if proc.returncode == 0 and os.path.exists(final_path):
+                        try:
+                            os.remove(v_path)
+                            os.remove(a_path)
+                        except Exception:
+                            pass
+                        return final_path
+                except Exception as e:
+                    logger.error(f"ffmpeg merge failed: {e}")
+                # cleanup on failure
+                try:
+                    if os.path.exists(v_path):
+                        os.remove(v_path)
+                    if os.path.exists(a_path):
+                        os.remove(a_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.info(f"Piped instance failed {base}: {e}")
+            continue
+    return None
 
 def _cleanup_url_cache():
     """Clean up expired entries from URL cache"""
@@ -267,7 +389,7 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def download_direct(url: str, platform: str, update: Update) -> bool:
     try:
-                # Prefer Piped for YouTube if enabled
+        # Prefer Piped for YouTube if enabled
         if platform == 'youtube' and YOUTUBE_PIPED_ENABLED:
             path = _download_youtube_via_piped(url, platform)
             if path and os.path.exists(path):
@@ -401,7 +523,5 @@ async def download_urls_from_reply(update: Update, context: ContextTypes.DEFAULT
             success = await download_direct(url, platform, update)
         if not success:
             pass
-
-
 
 
