@@ -39,6 +39,13 @@ PLATFORM_PATTERNS = {
     'pinterest': r'(?:https?://)?(?:www\.)?(?:pinterest\.com|pin\.it)',
     'qqmusic': r'(?:https?://)?(?:www\.)?(?:y\.qq\.com|i\.y\.qq\.com)',
 }
+# Prefer using Piped API for YouTube if available to avoid cookie challenges
+YOUTUBE_PIPED_ENABLED = os.getenv('YOUTUBE_PIPED_ENABLED', 'true').lower() in ('1', 'true', 'yes')
+PIPED_INSTANCES = [
+    'https://piped.video',
+    'https://piped.mha.fi',
+    'https://piped.projectsegfau.lt',
+]
 
 def detect_platform(url: str) -> str:
     """Detect platform from URL"""
@@ -387,5 +394,6 @@ async def download_urls_from_reply(update: Update, context: ContextTypes.DEFAULT
             success = await download_direct(url, platform, update)
         if not success:
             pass
+
 
 
